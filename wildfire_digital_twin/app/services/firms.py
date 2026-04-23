@@ -7,7 +7,12 @@ from typing import Iterable, Optional
 import pandas as pd
 import requests
 
-FIRMS_BASE = "https://firms.modaps.eosdis.nasa.gov/api/area/csv"
+FIRMS_BASE_URLS = [
+    # Matches the USFS map experience.
+    "https://firms.modaps.eosdis.nasa.gov/usfs/api/area/csv",
+    # Global fallback endpoint.
+    "https://firms.modaps.eosdis.nasa.gov/api/area/csv",
+]
 DEFAULT_DATASETS = [
     "VIIRS_NOAA21_NRT",
     "VIIRS_NOAA20_NRT",
@@ -42,19 +47,30 @@ class FirmsClient:
         day_range: int = 1,
         date: Optional[str] = None,
     ) -> pd.DataFrame:
-        url = f"{FIRMS_BASE}/{self.map_key}/{dataset}/{bbox.as_firms_area()}/{day_range}"
-        if date:
-            url = f"{url}/{date}"
-        response = requests.get(url, timeout=self.timeout)
-        response.raise_for_status()
-        text = response.text.strip()
-        if not text:
-            return pd.DataFrame()
-        df = pd.read_csv(StringIO(text))
-        if df.empty:
-            return df
-        df["dataset"] = dataset
-        return self._normalize(df)
+        last_http_error: requests.HTTPError | None = None
+        for base_url in FIRMS_BASE_URLS:
+            url = f"{base_url}/{self.map_key}/{dataset}/{bbox.as_firms_area()}/{day_range}"
+            if date:
+                url = f"{url}/{date}"
+            response = requests.get(url, timeout=self.timeout)
+            try:
+                response.raise_for_status()
+            except requests.HTTPError as exc:
+                last_http_error = exc
+                continue
+
+            text = response.text.strip()
+            if not text:
+                return pd.DataFrame()
+            df = pd.read_csv(StringIO(text))
+            if df.empty:
+                return df
+            df["dataset"] = dataset
+            return self._normalize(df)
+
+        if last_http_error is not None:
+            raise last_http_error
+        return pd.DataFrame()
 
     def fetch_many(
         self,
@@ -64,14 +80,29 @@ class FirmsClient:
     ) -> pd.DataFrame:
         datasets = list(datasets or DEFAULT_DATASETS)
         frames: list[pd.DataFrame] = []
+        errors: list[str] = []
         for ds in datasets:
             try:
                 df = self.fetch_area(ds, bbox=bbox, day_range=day_range)
                 if not df.empty:
                     frames.append(df)
-            except requests.HTTPError:
+            except requests.HTTPError as exc:
+                status = exc.response.status_code if exc.response is not None else "unknown"
+                body = ""
+                if exc.response is not None and exc.response.text:
+                    body = exc.response.text.strip().replace("\n", " ")
+                    body = body[:180]
+                details = f"{ds}: HTTP {status}"
+                if body:
+                    details = f"{details} - {body}"
+                errors.append(details)
                 continue
         if not frames:
+            if errors and len(errors) == len(datasets):
+                raise RuntimeError(
+                    "FIRMS request failed for all selected datasets. "
+                    + " | ".join(errors)
+                )
             return pd.DataFrame(columns=self._output_columns())
         out = pd.concat(frames, ignore_index=True)
         out = out.sort_values("timestamp_utc", ascending=False).reset_index(drop=True)
