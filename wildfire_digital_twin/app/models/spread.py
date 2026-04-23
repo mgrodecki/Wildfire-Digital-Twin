@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Callable
 
 import numpy as np
 import pandas as pd
@@ -90,6 +91,8 @@ class SpreadPredictor:
         grid_size: int | None = None,
         steps: int | None = None,
         runs: int | None = None,
+        progress_callback: Callable[[int, int], None] | None = None,
+        should_stop: Callable[[], bool] | None = None,
     ) -> dict:
         grid_size = grid_size or self.config.grid_size
         steps = steps or self.config.steps
@@ -120,7 +123,12 @@ class SpreadPredictor:
         power_density = points_to_density_raster(infrastructure.get("power_lines", pd.DataFrame()), extent, (grid_size, grid_size), sigma_cells=2)
 
         burn_sum = np.zeros((grid_size, grid_size), dtype=float)
-        for _ in range(runs):
+        completed_runs = 0
+        stopped_early = False
+        for run_idx in range(runs):
+            if should_stop is not None and should_stop():
+                stopped_early = True
+                break
             burn_sum += self._run_once(
                 seed_fire=seed_fire,
                 fuel=fuel,
@@ -135,8 +143,14 @@ class SpreadPredictor:
                 wind_dir_deg=wind_dir_deg,
                 steps=steps,
             )
+            completed_runs = run_idx + 1
+            if progress_callback is not None:
+                progress_callback(completed_runs, runs)
 
-        burn_probability = burn_sum / runs
+        if completed_runs == 0:
+            raise RuntimeError("AI spread simulation stopped before completing any Monte Carlo runs.")
+
+        burn_probability = burn_sum / completed_runs
         elevation_r = resample_to_shape(elevation, (grid_size, grid_size)) if elevation is not None else np.zeros((grid_size, grid_size))
         elev_norm = normalize_array(elevation_r)
         infrastructure_exposure = np.clip(0.5 * building_density + 0.25 * road_density + 0.25 * power_density, 0.0, 1.0)
@@ -168,6 +182,11 @@ class SpreadPredictor:
             "road_density": road_density,
             "power_density": power_density,
             "infrastructure_exposure": infrastructure_exposure,
+            "simulation": {
+                "requested_runs": runs,
+                "completed_runs": completed_runs,
+                "stopped_early": stopped_early,
+            },
         }
 
     def _make_environment(

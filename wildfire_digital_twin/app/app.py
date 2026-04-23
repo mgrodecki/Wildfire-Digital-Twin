@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import os
-from typing import List
+import threading
+import time
+from datetime import datetime, timezone
+from typing import Any, List
 
 import numpy as np
 import pandas as pd
@@ -42,14 +45,86 @@ def fetch_ndvi(bbox_tuple: tuple[float, float, float, float], grid_size: int):
     return VegScapeClient().fetch_grid(BBox(*bbox_tuple), grid_size=grid_size)
 
 
+def fallback_ndvi(grid_size: int):
+    return VegScapeClient.fallback_grid(grid_size=grid_size)
+
+
 @st.cache_data(ttl=60 * 60, show_spinner=False)
 def fetch_infrastructure(bbox_tuple: tuple[float, float, float, float]):
     return OverpassClient().fetch(BBox(*bbox_tuple))
 
 
-@st.cache_resource(show_spinner=False)
-def get_predictor() -> SpreadPredictor:
-    return SpreadPredictor(SpreadConfig())
+def _simulation_worker(
+    context: dict[str, Any],
+    progress_state: dict[str, Any],
+    stop_event: threading.Event,
+) -> None:
+    try:
+        predictor = SpreadPredictor(
+            SpreadConfig(
+                grid_size=context["grid_size"],
+                steps=context["sim_steps"],
+                runs=context["sim_runs"],
+            )
+        )
+
+        def on_progress(done_runs: int, total_runs: int) -> None:
+            progress_state["done"] = done_runs
+            progress_state["total"] = total_runs
+
+        result = predictor.simulate(
+            fires=context["fires"],
+            wind_speed_kmh=context["current_weather"].wind_speed_kmh,
+            wind_dir_deg=context["current_weather"].wind_direction_deg,
+            humidity_pct=context["current_weather"].humidity_pct,
+            terrain_slope=(context["terrain"].slope_deg if context["terrain"] else None),
+            elevation=(context["terrain"].elevation_m if context["terrain"] else None),
+            ndvi=(context["ndvi"].ndvi if context["ndvi"] else None),
+            fuel_moisture=(context["ndvi"].fuel_moisture if context["ndvi"] else None),
+            infrastructure={
+                "roads": context["infra"].roads if context["infra"] is not None else pd.DataFrame(),
+                "power_lines": context["infra"].power_lines if context["infra"] is not None else pd.DataFrame(),
+                "buildings": context["infra"].buildings if context["infra"] is not None else pd.DataFrame(),
+            },
+            grid_size=context["grid_size"],
+            steps=context["sim_steps"],
+            runs=context["sim_runs"],
+            progress_callback=on_progress,
+            should_stop=stop_event.is_set,
+        )
+        progress_state["result"] = result
+    except Exception as exc:
+        progress_state["error"] = str(exc)
+
+
+def make_demo_fires(bbox: BBox, count: int = 10) -> pd.DataFrame:
+    rng = np.random.default_rng(42)
+    lats = rng.uniform(bbox.south, bbox.north, count)
+    lons = rng.uniform(bbox.west, bbox.east, count)
+    frp = rng.uniform(8.0, 65.0, count)
+    now = pd.Timestamp(datetime.now(timezone.utc)).floor("min")
+    acq_date = now.strftime("%Y-%m-%d")
+    acq_time = now.strftime("%H%M")
+    return pd.DataFrame(
+        {
+            "latitude": lats,
+            "longitude": lons,
+            "brightness": rng.uniform(300.0, 380.0, count),
+            "bright_ti5": rng.uniform(260.0, 320.0, count),
+            "frp": frp,
+            "scan": np.full(count, 0.5),
+            "track": np.full(count, 0.5),
+            "acq_date": [acq_date] * count,
+            "acq_time": [acq_time] * count,
+            "timestamp_utc": [now] * count,
+            "satellite": ["DEMO"] * count,
+            "instrument": ["SIM"] * count,
+            "confidence": ["demo"] * count,
+            "version": ["demo"] * count,
+            "daynight": ["D"] * count,
+            "dataset": ["DEMO_SYNTHETIC"] * count,
+        }
+    )
 
 
 def build_map(
@@ -183,6 +258,17 @@ def main() -> None:
     st.title("Real-Time Wildfire Dashboard with Terrain, NDVI, and Infrastructure")
     st.caption("Live FIRMS hotspots + real terrain + NDVI/fuel moisture proxy + roads/power/buildings + AI spread forecast")
 
+    st.session_state.setdefault("sim_thread", None)
+    st.session_state.setdefault("sim_stop_event", None)
+    st.session_state.setdefault("sim_progress", {"done": 0, "total": 0, "result": None, "error": None})
+    st.session_state.setdefault("sim_context", None)
+    st.session_state.setdefault("sim_running", False)
+
+    if st.session_state.sim_running:
+        thread = st.session_state.sim_thread
+        if thread is None or not thread.is_alive():
+            st.session_state.sim_running = False
+
     with st.sidebar:
         st.header("Controls")
         map_key = st.text_input("NASA FIRMS MAP_KEY", value=os.getenv("FIRMS_MAP_KEY", ""), type="password")
@@ -199,72 +285,132 @@ def main() -> None:
         load_terrain = st.toggle("Load real terrain", value=True)
         load_ndvi = st.toggle("Load NDVI / fuel moisture", value=True)
         load_infra = st.toggle("Load roads / power / buildings", value=True)
-        run_button = st.button("Run dashboard", type="primary")
+        demo_fires_on_empty = st.toggle("Use demo hotspots when FIRMS is empty", value=True)
+        run_sidebar_button = st.button("Run dashboard", type="primary", disabled=st.session_state.sim_running)
+        stop_sim_button = st.button("Stop AI spread simulation", disabled=not st.session_state.sim_running)
 
-    if not run_button:
-        st.info("Enter a FIRMS MAP_KEY, adjust the region, then click **Run dashboard**.")
-        return
-    if not map_key:
-        st.error("A NASA FIRMS MAP_KEY is required.")
-        return
+    if stop_sim_button and st.session_state.sim_running and st.session_state.sim_stop_event is not None:
+        st.session_state.sim_stop_event.set()
+        st.warning("Stop requested. Finishing current Monte Carlo iteration...")
 
-    bbox = (west, south, east, north)
-    bbox_obj = BBox(*bbox)
-    center_lat, center_lon = bbox_obj.center()
+    run_main_button = False
+    if not run_sidebar_button and not st.session_state.sim_running:
+        st.caption("Enter a FIRMS MAP_KEY, adjust the region, then click Run dashboard below or in the sidebar.")
+        run_main_button = st.button("Run dashboard", type="primary")
 
-    with st.spinner("Fetching live fire detections..."):
-        fires = fetch_fires(map_key, bbox, datasets, day_range)
-    if fires.empty:
-        st.warning("No active fires returned for the selected area/time window.")
-        return
+    if run_sidebar_button or run_main_button:
+        if not map_key:
+            st.error("A NASA FIRMS MAP_KEY is required.")
+            return
 
-    with st.spinner("Fetching weather..."):
-        current_weather, hourly_weather = fetch_weather(center_lat, center_lon)
+        bbox = (west, south, east, north)
+        bbox_obj = BBox(*bbox)
+        center_lat, center_lon = bbox_obj.center()
 
-    terrain = ndvi = infra = None
-    if load_terrain:
         try:
-            with st.spinner("Fetching terrain..."):
-                terrain = fetch_terrain(bbox, grid_size)
+            with st.spinner("Fetching live fire detections..."):
+                fires = fetch_fires(map_key, bbox, datasets, day_range)
         except Exception as exc:
-            st.warning(f"Terrain layer unavailable: {exc}")
-    if load_ndvi:
-        try:
-            with st.spinner("Fetching NDVI / fuel moisture..."):
-                ndvi = fetch_ndvi(bbox, grid_size)
-        except Exception as exc:
-            st.warning(f"NDVI layer unavailable: {exc}")
-    if load_infra:
-        try:
-            with st.spinner("Fetching infrastructure..."):
-                infra = fetch_infrastructure(bbox)
-        except Exception as exc:
-            st.warning(f"Infrastructure layer unavailable: {exc}")
+            st.error(f"FIRMS fetch failed: {exc}")
+            st.caption(
+                "Verify your MAP_KEY, selected datasets, and service availability. "
+                "If this persists, compare against the USFS FIRMS API endpoint for the same bbox/day range."
+            )
+            return
+        if fires.empty:
+            if demo_fires_on_empty:
+                fires = make_demo_fires(bbox_obj, count=10)
+                st.warning("No active fires returned for the selected area/time window. Using demo hotspots for simulation.")
+            else:
+                st.warning("No active fires returned for the selected area/time window.")
+                return
 
-    predictor = get_predictor()
-    predictor.config.grid_size = grid_size
-    predictor.config.steps = sim_steps
-    predictor.config.runs = sim_runs
+        with st.spinner("Fetching weather..."):
+            current_weather, hourly_weather = fetch_weather(center_lat, center_lon)
 
-    with st.spinner("Running AI spread simulation..."):
-        result = predictor.simulate(
-            fires=fires,
-            wind_speed_kmh=current_weather.wind_speed_kmh,
-            wind_dir_deg=current_weather.wind_direction_deg,
-            humidity_pct=current_weather.humidity_pct,
-            terrain_slope=(terrain.slope_deg if terrain else None),
-            elevation=(terrain.elevation_m if terrain else None),
-            ndvi=(ndvi.ndvi if ndvi else None),
-            fuel_moisture=(ndvi.fuel_moisture if ndvi else None),
-            infrastructure={
-                "roads": infra.roads if infra is not None else pd.DataFrame(),
-                "power_lines": infra.power_lines if infra is not None else pd.DataFrame(),
-                "buildings": infra.buildings if infra is not None else pd.DataFrame(),
-            },
-            grid_size=grid_size,
-            steps=sim_steps,
-            runs=sim_runs,
+        terrain = ndvi = infra = None
+        if load_terrain:
+            try:
+                with st.spinner("Fetching terrain..."):
+                    terrain = fetch_terrain(bbox, grid_size)
+            except Exception as exc:
+                st.warning(f"Terrain layer unavailable: {exc}")
+        if load_ndvi:
+            try:
+                with st.spinner("Fetching NDVI / fuel moisture..."):
+                    ndvi = fetch_ndvi(bbox, grid_size)
+            except Exception:
+                ndvi = fallback_ndvi(grid_size)
+                st.warning("NDVI layer unavailable from USDA VegScape. Using offline fallback NDVI proxy for this run.")
+        if load_infra:
+            try:
+                with st.spinner("Fetching infrastructure..."):
+                    infra = fetch_infrastructure(bbox)
+            except Exception as exc:
+                st.warning(f"Infrastructure layer unavailable: {exc}")
+
+        context: dict[str, Any] = {
+            "fires": fires,
+            "current_weather": current_weather,
+            "hourly_weather": hourly_weather,
+            "terrain": terrain,
+            "ndvi": ndvi,
+            "infra": infra,
+            "center_lat": center_lat,
+            "center_lon": center_lon,
+            "risk_threshold": risk_threshold,
+            "grid_size": grid_size,
+            "sim_steps": sim_steps,
+            "sim_runs": sim_runs,
+        }
+
+        stop_event = threading.Event()
+        progress_state: dict[str, Any] = {"done": 0, "total": sim_runs, "result": None, "error": None}
+        thread = threading.Thread(
+            target=_simulation_worker,
+            args=(context, progress_state, stop_event),
+            daemon=True,
         )
+        thread.start()
+        st.session_state.sim_thread = thread
+        st.session_state.sim_stop_event = stop_event
+        st.session_state.sim_progress = progress_state
+        st.session_state.sim_context = context
+        st.session_state.sim_running = True
+
+    if st.session_state.sim_running:
+        progress_state = st.session_state.sim_progress
+        done_runs = int(progress_state.get("done", 0))
+        total_runs = int(progress_state.get("total", 0) or 0)
+        progress_pct = min(1.0, done_runs / total_runs) if total_runs > 0 else 0.0
+        st.progress(progress_pct, text=f"AI spread simulation progress: {done_runs}/{total_runs} runs")
+        status_text = "Stopping simulation..." if (
+            st.session_state.sim_stop_event is not None and st.session_state.sim_stop_event.is_set()
+        ) else "AI spread simulation is running..."
+        st.caption(status_text)
+        time.sleep(0.5)
+        st.rerun()
+        return
+
+    progress_state = st.session_state.sim_progress
+    context = st.session_state.sim_context
+    if progress_state.get("error"):
+        st.error(f"AI spread simulation failed: {progress_state['error']}")
+        return
+    if context is None or progress_state.get("result") is None:
+        return
+
+    result = progress_state["result"]
+    fires = context["fires"]
+    current_weather = context["current_weather"]
+    hourly_weather = context["hourly_weather"]
+    terrain = context["terrain"]
+    ndvi = context["ndvi"]
+    infra = context["infra"]
+    center_lat = context["center_lat"]
+    center_lon = context["center_lon"]
+    risk_threshold = context["risk_threshold"]
+    grid_size = context["grid_size"]
 
     burn_pts = raster_to_points(result["burn_probability"], result["extent"], "burn_probability", threshold=0.10, stride=1)
     risk_pts = raster_to_points(result["risk_score"], result["extent"], "risk_score", threshold=risk_threshold, stride=1)
@@ -278,6 +424,12 @@ def main() -> None:
     roads = infra.roads if infra is not None else pd.DataFrame()
     power_lines = infra.power_lines if infra is not None else pd.DataFrame()
     buildings = infra.buildings if infra is not None else pd.DataFrame()
+    sim_meta = result.get("simulation", {})
+    if sim_meta.get("stopped_early"):
+        st.warning(
+            "AI spread simulation was stopped early. "
+            f"Completed {sim_meta.get('completed_runs', 0)} of {sim_meta.get('requested_runs', 0)} runs."
+        )
 
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Detections", f"{len(fires):,}")
@@ -319,6 +471,9 @@ def main() -> None:
                 "terrain_enabled": terrain is not None,
                 "ndvi_enabled": ndvi is not None,
                 "infrastructure_enabled": infra is not None,
+                "requested_runs": int(sim_meta.get("requested_runs", 0)),
+                "completed_runs": int(sim_meta.get("completed_runs", 0)),
+                "stopped_early": bool(sim_meta.get("stopped_early", False)),
             }
         )
         st.caption("Research/demo prototype only. Real incident support requires calibrated fuels, terrain, weather downscaling, and operational QA.")

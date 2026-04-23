@@ -17,7 +17,12 @@ class InfrastructureBundle:
 
 
 class OverpassClient:
-    BASE_URL = "https://overpass-api.de/api/interpreter"
+    BASE_URLS = [
+        "https://overpass-api.de/api/interpreter",
+        "https://overpass.kumi.systems/api/interpreter",
+        "https://overpass.openstreetmap.ru/api/interpreter",
+    ]
+    RETRYABLE_STATUS = {406, 429, 502, 503, 504}
 
     def __init__(self, timeout: int = 90) -> None:
         self.timeout = timeout
@@ -33,15 +38,40 @@ class OverpassClient:
         );
         out geom tags;
         """
-        response = requests.post(self.BASE_URL, data=query.encode("utf-8"), timeout=self.timeout)
-        response.raise_for_status()
-        payload = response.json()
+        payload = self._fetch_payload(query)
         elements = payload.get("elements", [])
 
         roads = self._paths_to_df(elements, feature_type="road", tag_key="highway")
         power = self._paths_to_df(elements, feature_type="power", tag_key="power", tag_value="line")
         buildings = self._buildings_to_df(elements)
         return InfrastructureBundle(roads=roads, power_lines=power, buildings=buildings)
+
+    def _fetch_payload(self, query: str) -> dict[str, Any]:
+        last_error: requests.HTTPError | None = None
+        headers = {
+            "Accept": "application/json",
+            "User-Agent": "wildfire-digital-twin/1.0",
+        }
+        for base_url in self.BASE_URLS:
+            response = requests.post(
+                base_url,
+                data={"data": query},
+                headers=headers,
+                timeout=self.timeout,
+            )
+            try:
+                response.raise_for_status()
+            except requests.HTTPError as exc:
+                status = exc.response.status_code if exc.response is not None else None
+                last_error = exc
+                if status in self.RETRYABLE_STATUS:
+                    continue
+                raise
+            return response.json()
+
+        if last_error is not None:
+            raise last_error
+        return {"elements": []}
 
     @staticmethod
     def _paths_to_df(elements: list[dict[str, Any]], feature_type: str, tag_key: str, tag_value: str | None = None) -> pd.DataFrame:

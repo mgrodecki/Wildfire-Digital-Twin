@@ -31,6 +31,16 @@ class VegScapeClient:
     def __init__(self, timeout: int = 60) -> None:
         self.timeout = timeout
 
+    @staticmethod
+    def fallback_grid(grid_size: int = 128) -> NdviResult:
+        # Offline-safe NDVI proxy so simulation can proceed when WMS is unavailable.
+        x = np.linspace(0.0, 1.0, grid_size, dtype=float)
+        y = np.linspace(0.0, 1.0, grid_size, dtype=float)
+        xx, yy = np.meshgrid(x, y, indexing="ij")
+        ndvi_like = np.clip(0.25 + 0.55 * (0.6 * np.sin(xx * 4.0) ** 2 + 0.4 * np.cos(yy * 3.0) ** 2), 0.0, 1.0)
+        fuel_moisture = np.clip(0.15 + 0.75 * ndvi_like, 0.0, 1.0)
+        return NdviResult(ndvi=ndvi_like, fuel_moisture=fuel_moisture, source="Fallback synthetic NDVI (offline)")
+
     def fetch_grid(self, bbox: BBox, grid_size: int = 128) -> NdviResult:
         time_hint = (datetime.now(timezone.utc) - timedelta(days=16)).date().isoformat()
         params = {
