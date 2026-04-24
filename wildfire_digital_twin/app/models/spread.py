@@ -72,7 +72,8 @@ class SpreadPredictor:
             max_depth=14,
             min_samples_leaf=3,
             random_state=self.config.seed,
-            n_jobs=-1,
+            # Avoid background-thread deadlocks on Windows when simulation runs in a worker thread.
+            n_jobs=1,
         )
         model.fit(X, y)
         return model
