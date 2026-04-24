@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import hashlib
 import os
+import pickle
 import threading
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, List
 
 import numpy as np
@@ -22,27 +25,85 @@ from utils.geo import raster_to_points
 st.set_page_config(page_title="Wildfire AI Dashboard", layout="wide")
 
 DEFAULT_BBOX = BBox(west=-125.0, south=32.0, east=-113.0, north=43.0)
+CACHE_DIR = Path(__file__).resolve().parents[1] / "data_cache"
+
+
+def _cache_file(prefix: str, key_parts: dict[str, Any]) -> Path:
+    payload = repr(sorted(key_parts.items())).encode("utf-8")
+    digest = hashlib.sha256(payload).hexdigest()
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    return CACHE_DIR / f"{prefix}_{digest}.pkl"
+
+
+def _cache_load(prefix: str, key_parts: dict[str, Any], ttl_seconds: int) -> Any | None:
+    path = _cache_file(prefix, key_parts)
+    if not path.exists():
+        return None
+    age = time.time() - path.stat().st_mtime
+    if age > ttl_seconds:
+        return None
+    try:
+        with path.open("rb") as f:
+            return pickle.load(f)
+    except Exception:
+        return None
+
+
+def _cache_save(prefix: str, key_parts: dict[str, Any], value: Any) -> Any:
+    path = _cache_file(prefix, key_parts)
+    with path.open("wb") as f:
+        pickle.dump(value, f)
+    return value
 
 
 @st.cache_data(ttl=60 * 20, show_spinner=False)
 def fetch_fires(map_key: str, bbox_tuple: tuple[float, float, float, float], datasets: List[str], day_range: int) -> pd.DataFrame:
-    return FirmsClient(map_key=map_key).fetch_many(bbox=BBox(*bbox_tuple), datasets=datasets, day_range=day_range)
+    key = {
+        "map_key": map_key,
+        "bbox": tuple(float(x) for x in bbox_tuple),
+        "datasets": tuple(datasets),
+        "day_range": int(day_range),
+    }
+    cached = _cache_load("fires", key, ttl_seconds=60 * 20)
+    if cached is not None:
+        return cached
+    value = FirmsClient(map_key=map_key).fetch_many(bbox=BBox(*bbox_tuple), datasets=datasets, day_range=day_range)
+    return _cache_save("fires", key, value)
 
 
 @st.cache_data(ttl=60 * 30, show_spinner=False)
 def fetch_weather(lat: float, lon: float):
+    key = {"lat": round(float(lat), 5), "lon": round(float(lon), 5), "hours": 24}
+    cached = _cache_load("weather", key, ttl_seconds=60 * 30)
+    if cached is not None:
+        return cached
     wx = OpenMeteoClient()
-    return wx.fetch_current(lat, lon), wx.fetch_hourly(lat, lon, hours=24)
+    value = (wx.fetch_current(lat, lon), wx.fetch_hourly(lat, lon, hours=24))
+    return _cache_save("weather", key, value)
 
 
 @st.cache_data(ttl=60 * 60, show_spinner=False)
 def fetch_terrain(bbox_tuple: tuple[float, float, float, float], grid_size: int):
-    return OpenTopoDataClient().fetch_grid(BBox(*bbox_tuple), grid_size=grid_size)
+    key = {"bbox": tuple(float(x) for x in bbox_tuple), "grid_size": int(grid_size)}
+    cached = _cache_load("terrain", key, ttl_seconds=60 * 60)
+    if cached is not None:
+        return cached
+    value = OpenTopoDataClient().fetch_grid(BBox(*bbox_tuple), grid_size=grid_size)
+    return _cache_save("terrain", key, value)
+
+
+def fallback_terrain(bbox_tuple: tuple[float, float, float, float], grid_size: int):
+    return OpenTopoDataClient.fallback_grid(BBox(*bbox_tuple), grid_size=grid_size)
 
 
 @st.cache_data(ttl=60 * 60, show_spinner=False)
 def fetch_ndvi(bbox_tuple: tuple[float, float, float, float], grid_size: int):
-    return VegScapeClient().fetch_grid(BBox(*bbox_tuple), grid_size=grid_size)
+    key = {"bbox": tuple(float(x) for x in bbox_tuple), "grid_size": int(grid_size)}
+    cached = _cache_load("ndvi", key, ttl_seconds=60 * 60)
+    if cached is not None:
+        return cached
+    value = VegScapeClient().fetch_grid(BBox(*bbox_tuple), grid_size=grid_size)
+    return _cache_save("ndvi", key, value)
 
 
 def fallback_ndvi(grid_size: int):
@@ -51,7 +112,12 @@ def fallback_ndvi(grid_size: int):
 
 @st.cache_data(ttl=60 * 60, show_spinner=False)
 def fetch_infrastructure(bbox_tuple: tuple[float, float, float, float]):
-    return OverpassClient().fetch(BBox(*bbox_tuple))
+    key = {"bbox": tuple(float(x) for x in bbox_tuple)}
+    cached = _cache_load("infrastructure", key, ttl_seconds=60 * 60)
+    if cached is not None:
+        return cached
+    value = OverpassClient().fetch(BBox(*bbox_tuple))
+    return _cache_save("infrastructure", key, value)
 
 
 def _simulation_worker(
@@ -60,6 +126,7 @@ def _simulation_worker(
     stop_event: threading.Event,
 ) -> None:
     try:
+        progress_state["status"] = "Preparing AI spread model..."
         predictor = SpreadPredictor(
             SpreadConfig(
                 grid_size=context["grid_size"],
@@ -72,6 +139,7 @@ def _simulation_worker(
             progress_state["done"] = done_runs
             progress_state["total"] = total_runs
 
+        progress_state["status"] = "Running Monte Carlo simulation..."
         result = predictor.simulate(
             fires=context["fires"],
             wind_speed_kmh=context["current_weather"].wind_speed_kmh,
@@ -93,6 +161,7 @@ def _simulation_worker(
             should_stop=stop_event.is_set,
         )
         progress_state["result"] = result
+        progress_state["status"] = "Simulation complete."
     except Exception as exc:
         progress_state["error"] = str(exc)
 
@@ -333,8 +402,9 @@ def main() -> None:
             try:
                 with st.spinner("Fetching terrain..."):
                     terrain = fetch_terrain(bbox, grid_size)
-            except Exception as exc:
-                st.warning(f"Terrain layer unavailable: {exc}")
+            except Exception:
+                terrain = fallback_terrain(bbox, grid_size)
+                st.warning("Terrain layer unavailable from OpenTopoData (rate limit or service issue). Using offline fallback terrain for this run.")
         if load_ndvi:
             try:
                 with st.spinner("Fetching NDVI / fuel moisture..."):
@@ -365,7 +435,13 @@ def main() -> None:
         }
 
         stop_event = threading.Event()
-        progress_state: dict[str, Any] = {"done": 0, "total": sim_runs, "result": None, "error": None}
+        progress_state: dict[str, Any] = {
+            "done": 0,
+            "total": sim_runs,
+            "result": None,
+            "error": None,
+            "status": "Queued...",
+        }
         thread = threading.Thread(
             target=_simulation_worker,
             args=(context, progress_state, stop_event),
@@ -386,7 +462,7 @@ def main() -> None:
         st.progress(progress_pct, text=f"AI spread simulation progress: {done_runs}/{total_runs} runs")
         status_text = "Stopping simulation..." if (
             st.session_state.sim_stop_event is not None and st.session_state.sim_stop_event.is_set()
-        ) else "AI spread simulation is running..."
+        ) else str(progress_state.get("status") or "AI spread simulation is running...")
         st.caption(status_text)
         time.sleep(0.5)
         st.rerun()
