@@ -111,6 +111,16 @@ Current suite includes smoke tests for:
 - `services.ndvi` fallback generation
 - `models.spread`
 
+## Simulation Algorithm
+
+- Detailed documentation: [AI_SIMULATION_ALGORITHM.md](c:/Codex/wildfire_digital_twin/docs/AI_SIMULATION_ALGORITHM.md)
+- Covers:
+  - surrogate model logic
+  - Monte Carlo spread steps
+  - area-by-area orchestration around selected FIRMS detections
+  - progress/stop behavior
+  - outputs, assumptions, and limitations
+
 ## Troubleshooting
 
 ### "No active fires returned for the selected area/time window."
